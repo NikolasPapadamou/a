@@ -11,9 +11,9 @@ import threading
 import tkinter as tk
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable, List, Optional, Tuple
 
 import RegulatoryMonitor as monitor
@@ -42,13 +42,16 @@ class RegulatoryMonitorApplication:
         self.worker_results: "queue.Queue[Tuple[str, Any, Any]]" = queue.Queue()
 
         self.root.title("Regulatory Updates Monitor")
-        self.root.geometry("900x800")
-        self.root.minsize(760, 680)
+        self.root.geometry("900x860")
+        self.root.minsize(760, 720)
         self.root.protocol("WM_DELETE_WINDOW", self._close_application)
 
         self.sender_var = tk.StringVar(value=DEFAULT_SENDER_LABEL)
         self.subject_var = tk.StringVar(value=DEFAULT_SUBJECT_PREFIX)
         self.attach_report_var = tk.BooleanVar(value=True)
+        self.report_directory_var = tk.StringVar(
+            value=str(monitor.default_reports_directory())
+        )
         self.recipient_entry_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ready")
         self.group_vars = {
@@ -94,7 +97,7 @@ class RegulatoryMonitorApplication:
 
         email_frame = ttk.LabelFrame(
             main,
-            text="Email settings",
+            text="Report and email settings",
             style="Section.TLabelframe",
             padding=12,
         )
@@ -190,6 +193,21 @@ class RegulatoryMonitorApplication:
             variable=self.attach_report_var,
         ).grid(row=5, column=1, columnspan=2, sticky="w", pady=(4, 0))
 
+        ttk.Label(email_frame, text="Save reports in:").grid(
+            row=6, column=0, sticky="w", padx=(0, 10), pady=(8, 4)
+        )
+        ttk.Entry(
+            email_frame,
+            textvariable=self.report_directory_var,
+        ).grid(row=6, column=1, sticky="ew", pady=(8, 4))
+        browse_button = ttk.Button(
+            email_frame,
+            text="Browse...",
+            command=self._choose_report_directory,
+        )
+        browse_button.grid(row=6, column=2, padx=(8, 0), pady=(8, 4))
+        self.action_buttons.append(browse_button)
+
         group_frame = ttk.LabelFrame(
             main,
             text="Groups for a manual run",
@@ -236,14 +254,22 @@ class RegulatoryMonitorApplication:
             command=self._send_test_email,
         )
         test_button.pack(side="left", padx=(8, 0))
-        run_button = ttk.Button(
+        email_run_button = ttk.Button(
             actions,
-            text="Run and email report now",
+            text="Run and email report",
             command=self._run_and_email_report,
             style="Primary.TButton",
         )
-        run_button.pack(side="right")
-        self.action_buttons.extend((save_button, test_button, run_button))
+        email_run_button.pack(side="right")
+        save_run_button = ttk.Button(
+            actions,
+            text="Run and save the report",
+            command=self._run_and_save_report,
+        )
+        save_run_button.pack(side="right", padx=(0, 8))
+        self.action_buttons.extend(
+            (save_button, test_button, save_run_button, email_run_button)
+        )
 
         output_frame = ttk.LabelFrame(
             main,
@@ -295,6 +321,8 @@ class RegulatoryMonitorApplication:
             self.recipient_list.insert(tk.END, recipient)
         self.subject_var.set(settings.subject_prefix)
         self.attach_report_var.set(settings.attach_report)
+        if settings.report_directory:
+            self.report_directory_var.set(settings.report_directory)
         if settings.sender_account:
             self.sender_var.set(settings.sender_account)
             self.sender_combo.configure(
@@ -332,6 +360,21 @@ class RegulatoryMonitorApplication:
             self.recipient_list.delete(index)
         self.status_var.set("Recipient list updated. Click Save settings.")
 
+    def _choose_report_directory(self) -> None:
+        current = self.report_directory_var.get().strip()
+        initial_directory = current if Path(current).is_dir() else str(Path.home())
+        selected = filedialog.askdirectory(
+            parent=self.root,
+            title="Choose where regulatory reports will be saved",
+            initialdir=initial_directory,
+            mustexist=False,
+        )
+        if selected:
+            self.report_directory_var.set(str(Path(selected).resolve()))
+            self.status_var.set(
+                "Report folder updated. Click Save settings."
+            )
+
     def _selected_sender(self) -> Optional[str]:
         value = self.sender_var.get().strip()
         if not value or value == DEFAULT_SENDER_LABEL:
@@ -343,17 +386,26 @@ class RegulatoryMonitorApplication:
             str(self.recipient_list.get(index))
             for index in range(self.recipient_list.size())
         )
+        report_directory = self.report_directory_var.get().strip()
+        if not report_directory:
+            report_directory = str(monitor.default_reports_directory())
+        report_directory = str(Path(report_directory).expanduser().resolve())
         return EmailSettings(
             recipients=recipients,
             subject_prefix=self.subject_var.get(),
             attach_report=bool(self.attach_report_var.get()),
             sender_account=self._selected_sender(),
+            report_directory=report_directory,
         )
 
     def _save_settings(self, show_confirmation: bool) -> Optional[EmailSettings]:
         try:
             settings = self._current_settings()
-            save_email_settings(self.config_path, settings)
+            save_email_settings(
+                self.config_path,
+                settings,
+                require_recipients=False,
+            )
         except EmailConfigurationError as exc:
             messagebox.showerror("Cannot save settings", str(exc), parent=self.root)
             return None
@@ -361,10 +413,23 @@ class RegulatoryMonitorApplication:
         if show_confirmation:
             messagebox.showinfo(
                 "Settings saved",
-                "The email settings were saved successfully.",
+                "The report and email settings were saved successfully.",
                 parent=self.root,
             )
         return settings
+
+    def _require_email_recipients(
+        self,
+        settings: EmailSettings,
+    ) -> bool:
+        if settings.recipients:
+            return True
+        messagebox.showerror(
+            "No email recipients",
+            "Add at least one recipient before sending an email.",
+            parent=self.root,
+        )
+        return False
 
     def _sender_changed(self, event: Optional[tk.Event] = None) -> None:
         sender = self._selected_sender()
@@ -426,7 +491,7 @@ class RegulatoryMonitorApplication:
 
     def _send_test_email(self) -> None:
         settings = self._save_settings(False)
-        if settings is None:
+        if settings is None or not self._require_email_recipients(settings):
             return
         sender_text = settings.sender_account or "the Outlook default account"
         if not messagebox.askyesno(
@@ -462,9 +527,98 @@ class RegulatoryMonitorApplication:
 
         self._start_worker("Sending test email...", worker, complete)
 
-    def _run_and_email_report(self) -> None:
+    def _run_and_save_report(self) -> None:
         settings = self._save_settings(False)
         if settings is None:
+            return
+        selected_groups = self._selected_groups()
+        if not selected_groups:
+            messagebox.showerror(
+                "No groups selected",
+                "Select at least one regulatory group.",
+                parent=self.root,
+            )
+            return
+
+        reports_directory = Path(
+            settings.report_directory or monitor.default_reports_directory()
+        ).expanduser().resolve()
+        report_path = monitor.timestamped_report_path(
+            reports_directory,
+            datetime.now(timezone.utc),
+        )
+        group_text = ", ".join(str(number) for number in selected_groups)
+        if not messagebox.askyesno(
+            "Run and save report",
+            (
+                f"Check Group(s) {group_text} and save the complete report "
+                f"to:\n\n{report_path}\n\n"
+                "No email will be sent. This can take several minutes."
+            ),
+            parent=self.root,
+        ):
+            return
+
+        self._replace_output("Starting regulatory monitoring run...\n")
+
+        def worker() -> Tuple[int, str]:
+            standard_output = io.StringIO()
+            error_output = io.StringIO()
+            with redirect_stdout(standard_output), redirect_stderr(error_output):
+                exit_code = monitor.main(
+                    [
+                        "--groups",
+                        ",".join(str(number) for number in selected_groups),
+                        "--report-file",
+                        str(report_path),
+                    ]
+                )
+            combined = standard_output.getvalue()
+            errors = error_output.getvalue()
+            if errors:
+                combined = f"{combined}\n{errors}".strip() + "\n"
+            return exit_code, combined
+
+        def complete(result: Tuple[int, str]) -> None:
+            exit_code, output = result
+            self._replace_output(output)
+            if exit_code == 0:
+                self.status_var.set(f"Report saved to {report_path}")
+                messagebox.showinfo(
+                    "Report saved",
+                    f"The complete report was saved to:\n\n{report_path}",
+                    parent=self.root,
+                )
+            else:
+                if report_path.is_file():
+                    self.status_var.set(
+                        f"Report saved with warnings to {report_path}"
+                    )
+                    warning = (
+                        "The report was saved, but one or more groups had a "
+                        f"problem.\n\nSaved to:\n{report_path}\n\n"
+                        "Review the Run output section for details."
+                    )
+                else:
+                    self.status_var.set(
+                        "The run finished with a problem. Review the output below."
+                    )
+                    warning = "Review the Run output section for details."
+                messagebox.showwarning(
+                    "Run finished with a problem",
+                    warning,
+                    parent=self.root,
+                )
+
+        self._start_worker(
+            "Checking regulatory sources and saving the report...",
+            worker,
+            complete,
+        )
+
+    def _run_and_email_report(self) -> None:
+        settings = self._save_settings(False)
+        if settings is None or not self._require_email_recipients(settings):
             return
         selected_groups = self._selected_groups()
         if not selected_groups:
@@ -499,6 +653,13 @@ class RegulatoryMonitorApplication:
                         "--send-email",
                         "--email-config",
                         str(self.config_path),
+                        "--reports-dir",
+                        str(
+                            Path(
+                                settings.report_directory
+                                or monitor.default_reports_directory()
+                            ).expanduser().resolve()
+                        ),
                     ]
                 )
             combined = standard_output.getvalue()
@@ -520,12 +681,25 @@ class RegulatoryMonitorApplication:
                     parent=self.root,
                 )
             else:
-                self.status_var.set(
-                    "The run finished with a problem. Review the output below."
-                )
+                report_saved = "Report saved to:" in output
+                if report_saved:
+                    self.status_var.set(
+                        "Email delivery failed or the run was partial, but the "
+                        "local report was saved."
+                    )
+                    warning = (
+                        "The email was not fully successful, but the local "
+                        "report was saved. Review the Run output section for "
+                        "the exact path and error details."
+                    )
+                else:
+                    self.status_var.set(
+                        "The run finished with a problem. Review the output below."
+                    )
+                    warning = "Review the Run output section for details."
                 messagebox.showwarning(
                     "Run finished with a problem",
-                    "Review the Run output section for details.",
+                    warning,
                     parent=self.root,
                 )
 

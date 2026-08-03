@@ -596,10 +596,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reports-dir",
         type=Path,
-        default=default_reports_directory(),
         help=(
-            "folder for automatically saved emailed reports "
-            f"(default: {default_reports_directory()})"
+            "folder for automatically saved emailed reports; defaults to "
+            "the folder saved in email settings, or "
+            f"{default_reports_directory()}"
         ),
     )
     parser.add_argument(
@@ -679,8 +679,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if arguments.report_file:
                     report_path = arguments.report_file.resolve()
                 else:
+                    if arguments.reports_dir is not None:
+                        reports_directory = arguments.reports_dir.resolve()
+                    elif settings.report_directory:
+                        reports_directory = Path(
+                            settings.report_directory
+                        ).expanduser().resolve()
+                    else:
+                        reports_directory = default_reports_directory()
                     report_path = timestamped_report_path(
-                        arguments.reports_dir.resolve(), finished_at
+                        reports_directory, finished_at
                     )
                 save_report(report_path, report)
                 print(f"\nReport saved to: {report_path}")

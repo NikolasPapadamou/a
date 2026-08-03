@@ -30,6 +30,7 @@ class EmailSettings:
     subject_prefix: str = DEFAULT_SUBJECT_PREFIX
     attach_report: bool = True
     sender_account: Optional[str] = None
+    report_directory: Optional[str] = None
 
 
 def validate_email_address(value: Any, field_name: str = "email address") -> str:
@@ -86,6 +87,23 @@ def _validate_sender_account(value: Any) -> Optional[str]:
     return validate_email_address(value, "Outlook sender account")
 
 
+def _validate_report_directory(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise EmailConfigurationError(
+            "'report_directory' must be a folder path or null."
+        )
+    directory = value.strip()
+    if not directory:
+        return None
+    if "\x00" in directory or "\r" in directory or "\n" in directory:
+        raise EmailConfigurationError(
+            "'report_directory' contains invalid characters."
+        )
+    return directory
+
+
 def load_email_settings(
     path: Path,
     require_recipients: bool = True,
@@ -123,22 +141,36 @@ def load_email_settings(
         )
 
     sender_account = _validate_sender_account(data.get("sender_account"))
+    report_directory = _validate_report_directory(
+        data.get("report_directory")
+    )
 
     return EmailSettings(
         recipients=recipients,
         subject_prefix=subject_prefix,
         attach_report=attach_report,
         sender_account=sender_account,
+        report_directory=report_directory,
     )
 
 
-def save_email_settings(path: Path, settings: EmailSettings) -> None:
+def save_email_settings(
+    path: Path,
+    settings: EmailSettings,
+    require_recipients: bool = True,
+) -> None:
     """Validate and atomically save non-secret email preferences."""
     validated = EmailSettings(
-        recipients=_validate_recipients(list(settings.recipients)),
+        recipients=_validate_recipients(
+            list(settings.recipients),
+            require_recipients=require_recipients,
+        ),
         subject_prefix=_validate_subject_prefix(settings.subject_prefix),
         attach_report=settings.attach_report,
         sender_account=_validate_sender_account(settings.sender_account),
+        report_directory=_validate_report_directory(
+            settings.report_directory
+        ),
     )
     if not isinstance(validated.attach_report, bool):
         raise EmailConfigurationError("'attach_report' must be true or false.")
@@ -161,6 +193,7 @@ def save_email_settings(path: Path, settings: EmailSettings) -> None:
                     "subject_prefix": validated.subject_prefix,
                     "attach_report": validated.attach_report,
                     "sender_account": validated.sender_account,
+                    "report_directory": validated.report_directory,
                 },
                 temporary_file,
                 indent=2,
