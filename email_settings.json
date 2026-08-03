@@ -1,0 +1,8 @@
+{
+  "recipients": [
+    "lol@gmail.com"
+  ],
+  "subject_prefix": "Regulatory Monitoring Report",
+  "attach_report": true,
+  "sender_account": null
+}
