@@ -7,6 +7,7 @@ import argparse
 import io
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -23,6 +24,13 @@ import Group7
 import group4
 import group5
 import group6
+from email_delivery import (
+    EmailConfigurationError,
+    EmailDeliveryError,
+    EmailSettings,
+    load_email_settings,
+    send_report_via_outlook,
+)
 
 
 DEFAULT_TIMEOUT_SECONDS = 45.0
@@ -128,6 +136,18 @@ def default_state_directory() -> Path:
     if getattr(sys, "frozen", False):
         return application_directory / "state"
     return application_directory
+
+
+def default_email_config_path() -> Path:
+    return _application_directory() / "email_settings.json"
+
+
+def default_reports_directory() -> Path:
+    return _application_directory() / "reports"
+
+
+def default_email_log_path() -> Path:
+    return _application_directory() / "logs" / "email_delivery.log"
 
 
 def configure_console_encoding() -> None:
@@ -361,6 +381,156 @@ def save_report(path: Path, report: str) -> None:
         raise RuntimeError(f"Could not save report to {path}: {exc}") from exc
 
 
+def timestamped_report_path(
+    reports_directory: Path,
+    finished_at: datetime,
+) -> Path:
+    """Return a non-conflicting local filename for an emailed report."""
+    local_time = finished_at.astimezone()
+    base_name = local_time.strftime("Regulatory_Report_%Y-%m-%d_%H%M%S")
+    candidate = reports_directory / f"{base_name}.txt"
+    suffix = 1
+    while candidate.exists():
+        candidate = reports_directory / f"{base_name}_{suffix:02d}.txt"
+        suffix += 1
+    return candidate
+
+
+def build_email_subject(
+    settings: EmailSettings,
+    results: Sequence[GroupResult],
+    finished_at: datetime,
+) -> str:
+    total_updates = sum(result.update_count for result in results)
+    failed_count = sum(1 for result in results if not result.succeeded)
+    status = "PARTIAL - " if failed_count else ""
+    date_text = finished_at.astimezone().strftime("%d/%m/%Y")
+    return (
+        f"{settings.subject_prefix} - {date_text} - "
+        f"{status}{total_updates} new update(s)"
+    )
+
+
+def append_email_log(path: Path, status: str, details: str) -> None:
+    """Append a small delivery audit entry without recording recipients."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).astimezone().isoformat(
+        timespec="seconds"
+    )
+    clean_details = " ".join(details.splitlines()).strip()
+    with path.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"{timestamp} | {status} | {clean_details}\n")
+
+
+def _copy_live_states_to_staging(
+    group_numbers: Sequence[int],
+    live_directory: Path,
+    staging_directory: Path,
+) -> None:
+    staging_directory.mkdir(parents=True, exist_ok=True)
+    for number in group_numbers:
+        filename = GROUP_BY_NUMBER[number].state_filename
+        live_file = live_directory / filename
+        if live_file.is_file():
+            shutil.copy2(live_file, staging_directory / filename)
+
+
+def _validate_staged_states(
+    results: Sequence[GroupResult],
+    staging_directory: Path,
+) -> None:
+    """Ensure successful groups produced state before an email is sent."""
+    for result in results:
+        if not result.succeeded:
+            continue
+        candidate = staging_directory / result.state_file.name
+        if not candidate.is_file() or candidate.stat().st_size == 0:
+            raise RuntimeError(
+                f"{result.display_name} did not produce a valid staged state "
+                "file, so the report was not emailed."
+            )
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    temporary_name = ""
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with source.open("rb") as source_file, tempfile.NamedTemporaryFile(
+            "wb",
+            dir=str(destination.parent),
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_name = temporary_file.name
+            shutil.copyfileobj(source_file, temporary_file)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_name, destination)
+    except OSError as exc:
+        if temporary_name:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+        raise RuntimeError(
+            f"Could not update state file {destination}: {exc}"
+        ) from exc
+
+
+def commit_emailed_states(
+    results: Sequence[GroupResult],
+    live_directory: Path,
+    staging_directory: Path,
+) -> None:
+    """Commit successful group states after Outlook accepts the email.
+
+    Existing states are backed up and restored if a later replacement fails.
+    If this function fails after Outlook accepted the message, the next run may
+    send a duplicate rather than risk losing an update.
+    """
+    successful = [result for result in results if result.succeeded]
+    live_directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=str(live_directory), prefix=".email-state-backup-"
+    ) as backup_name:
+        backup_directory = Path(backup_name)
+        originally_present = set()
+        replaced = []
+        for result in successful:
+            live_file = live_directory / result.state_file.name
+            if live_file.is_file():
+                shutil.copy2(live_file, backup_directory / live_file.name)
+                originally_present.add(live_file.name)
+
+        try:
+            for result in successful:
+                candidate = staging_directory / result.state_file.name
+                live_file = live_directory / result.state_file.name
+                _atomic_copy(candidate, live_file)
+                replaced.append(live_file)
+        except (OSError, RuntimeError) as exc:
+            rollback_errors = []
+            for live_file in reversed(replaced):
+                try:
+                    if live_file.name in originally_present:
+                        _atomic_copy(
+                            backup_directory / live_file.name,
+                            live_file,
+                        )
+                    else:
+                        live_file.unlink(missing_ok=True)
+                except (OSError, RuntimeError) as rollback_exc:
+                    rollback_errors.append(str(rollback_exc))
+            extra = ""
+            if rollback_errors:
+                extra = " Rollback warning: " + "; ".join(rollback_errors)
+            raise RuntimeError(
+                "The email was submitted, but saved-history files could not "
+                f"be committed. A later run may resend updates. {exc}{extra}"
+            ) from exc
+
+
 def print_group_list() -> None:
     print("Available regulatory source groups:")
     for group in GROUPS:
@@ -407,6 +577,46 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="optionally save the combined report as a UTF-8 text file",
     )
     parser.add_argument(
+        "--send-email",
+        action="store_true",
+        help=(
+            "save and send the full report through the current Microsoft "
+            "Outlook profile"
+        ),
+    )
+    parser.add_argument(
+        "--email-config",
+        type=Path,
+        default=default_email_config_path(),
+        help=(
+            "JSON file containing recipients and email preferences "
+            f"(default: {default_email_config_path()})"
+        ),
+    )
+    parser.add_argument(
+        "--reports-dir",
+        type=Path,
+        default=default_reports_directory(),
+        help=(
+            "folder for automatically saved emailed reports "
+            f"(default: {default_reports_directory()})"
+        ),
+    )
+    parser.add_argument(
+        "--email-log",
+        type=Path,
+        default=default_email_log_path(),
+        help=(
+            "delivery audit log used by email mode "
+            f"(default: {default_email_log_path()})"
+        ),
+    )
+    parser.add_argument(
+        "--validate-email-config",
+        action="store_true",
+        help="validate the email settings without checking websites or sending",
+    )
+    parser.add_argument(
         "--list-groups",
         action="store_true",
         help="show the seven groups and exit",
@@ -420,15 +630,133 @@ def main(argv: Optional[List[str]] = None) -> int:
     if arguments.list_groups:
         print_group_list()
         return 0
+    if arguments.validate_email_config:
+        try:
+            settings = load_email_settings(arguments.email_config.resolve())
+            print(
+                "Email settings are valid. "
+                f"Configured recipients: {len(settings.recipients)}."
+            )
+            return 0
+        except EmailConfigurationError as exc:
+            print(f"Email configuration error: {exc}", file=sys.stderr)
+            return 2
     if arguments.timeout <= 0:
         print("Error: --timeout must be greater than zero.", file=sys.stderr)
         return 2
 
     started_at = datetime.now(timezone.utc)
+    live_state_directory = arguments.state_dir.resolve()
+    settings: Optional[EmailSettings] = None
     try:
+        if arguments.send_email:
+            settings = load_email_settings(arguments.email_config.resolve())
+            live_state_directory.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                dir=str(live_state_directory),
+                prefix=".email-state-staging-",
+            ) as staging_name:
+                staging_directory = Path(staging_name)
+                _copy_live_states_to_staging(
+                    group_numbers=arguments.groups,
+                    live_directory=live_state_directory,
+                    staging_directory=staging_directory,
+                )
+                results = run_selected_groups(
+                    group_numbers=arguments.groups,
+                    state_directory=staging_directory,
+                    timeout=arguments.timeout,
+                )
+                finished_at = datetime.now(timezone.utc)
+                report = build_combined_report(
+                    results=results,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                )
+                print(report, end="")
+                _validate_staged_states(results, staging_directory)
+
+                if arguments.report_file:
+                    report_path = arguments.report_file.resolve()
+                else:
+                    report_path = timestamped_report_path(
+                        arguments.reports_dir.resolve(), finished_at
+                    )
+                save_report(report_path, report)
+                print(f"\nReport saved to: {report_path}")
+
+                subject = build_email_subject(
+                    settings=settings,
+                    results=results,
+                    finished_at=finished_at,
+                )
+                try:
+                    send_report_via_outlook(
+                        settings=settings,
+                        subject=subject,
+                        report=report,
+                        report_path=report_path,
+                    )
+                except EmailDeliveryError as exc:
+                    try:
+                        append_email_log(
+                            arguments.email_log.resolve(),
+                            "FAILED",
+                            f"Report: {report_path}. Error: {exc}",
+                        )
+                    except OSError as log_exc:
+                        print(
+                            f"Warning: could not write email log: {log_exc}",
+                            file=sys.stderr,
+                        )
+                    raise
+
+                try:
+                    commit_emailed_states(
+                        results=results,
+                        live_directory=live_state_directory,
+                        staging_directory=staging_directory,
+                    )
+                except RuntimeError as exc:
+                    try:
+                        append_email_log(
+                            arguments.email_log.resolve(),
+                            "SENT_STATE_COMMIT_FAILED",
+                            f"Report: {report_path}. Error: {exc}",
+                        )
+                    except OSError as log_exc:
+                        print(
+                            f"Warning: could not write email log: {log_exc}",
+                            file=sys.stderr,
+                        )
+                    raise
+                try:
+                    append_email_log(
+                        arguments.email_log.resolve(),
+                        "SENT",
+                        (
+                            f"Report: {report_path}. "
+                            f"Recipients: {len(settings.recipients)}."
+                        ),
+                    )
+                except OSError as log_exc:
+                    print(
+                        f"Warning: could not write email log: {log_exc}",
+                        file=sys.stderr,
+                    )
+                print(
+                    "Email submitted to Outlook successfully for "
+                    f"{len(settings.recipients)} recipient(s)."
+                )
+                return (
+                    1
+                    if any(not result.succeeded for result in results)
+                    else 0
+                )
+
         results = run_selected_groups(
             group_numbers=arguments.groups,
-            state_directory=arguments.state_dir.resolve(),
+            state_directory=live_state_directory,
             timeout=arguments.timeout,
         )
         finished_at = datetime.now(timezone.utc)
@@ -439,12 +767,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         print(report, end="")
         if arguments.report_file:
-            save_report(arguments.report_file.resolve(), report)
-            print(
-                f"\nReport saved to: {arguments.report_file.resolve()}"
-            )
+            report_path = arguments.report_file.resolve()
+            save_report(report_path, report)
+            print(f"\nReport saved to: {report_path}")
         return 1 if any(not result.succeeded for result in results) else 0
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (
+        EmailConfigurationError,
+        EmailDeliveryError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
